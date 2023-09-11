@@ -1,7 +1,3 @@
-"""
-Copright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
-"""
-
 import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
 from pathlib import Path
 import numpy as np
@@ -206,7 +202,6 @@ class Cellpose():
             style vector summarizing each image, also used to estimate size of objects in image
 
         diams: list of diameters, or float (if do_3D=True)
-
         """        
 
         tic0 = time.time()
@@ -304,19 +299,22 @@ class CellposeModel(UnetModel):
 
     concatenation: bool (optional, default False)
         if True, concatentate downsampling block outputs with upsampling block inputs; 
-        default is to add 
-    
+        default is to add
+
     nchan: int (optional, default 2)
         number of channels to use as input to network, default is 2 
         (cyto + nuclei) or (nuclei + zeros)
-    
+
+    do_cgru: bool
+        whether to learn cross-slice from consecutive 2D slices
+        from 3D training dataset
     """
     
     def __init__(self, gpu=False, pretrained_model=False, 
                     model_type=None, net_avg=False,
                     diam_mean=30., device=None,
                     residual_on=True, style_on=True, concatenation=False,
-                    nchan=2):
+                    nchan=2, do_cgru=False):
         self.torch = True
         if isinstance(pretrained_model, np.ndarray):
             pretrained_model = list(pretrained_model)
@@ -324,6 +322,7 @@ class CellposeModel(UnetModel):
             pretrained_model = [pretrained_model]
     
         self.diam_mean = diam_mean
+        self.do_cgru = True if do_cgru > 0 else False
         builtin = True
         
 
@@ -365,7 +364,7 @@ class CellposeModel(UnetModel):
         super().__init__(gpu=gpu, pretrained_model=False,
                          diam_mean=self.diam_mean, net_avg=net_avg, device=device,
                          residual_on=residual_on, style_on=style_on, concatenation=concatenation,
-                        nchan=nchan)
+                        nchan=nchan, do_cgru=self.do_cgru)
 
         self.unet = False
         self.pretrained_model = pretrained_model
@@ -373,10 +372,24 @@ class CellposeModel(UnetModel):
             self.net.load_model(self.pretrained_model[0], device=self.device)
             self.diam_mean = self.net.diam_mean.data.cpu().numpy()[0]
             self.diam_labels = self.net.diam_labels.data.cpu().numpy()[0]
+
+            # transfer learning: freeze all but CGRU layers pretrained with regular Cellpose
+            if self.do_cgru and os.path.exists(pretrained_model[0]):
+                for name, param in self.net.named_parameters():
+                    if name.startswith('cgru'): # TODO: add thresholding criteria for Attention layers
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+
+                models_logger.info(f'>>>> Freeze Unet layers & retrain the following CGRU params')
+                for name, param in self.net.named_parameters():
+                    if param.requires_grad:
+                        models_logger.info(f'>>>>\t\t {name}')
+                
             models_logger.info(f'>>>> model diam_mean = {self.diam_mean: .3f} (ROIs rescaled to this size during training)')
             if not builtin:
                 models_logger.info(f'>>>> model diam_labels = {self.diam_labels: .3f} (mean diameter of training ROIs)')
-        
+
         ostr = ['off', 'on']
         self.net_type = 'cellpose_residual_{}_style_{}_concatenation_{}'.format(ostr[residual_on],
                                                                                    ostr[style_on],
@@ -390,7 +403,7 @@ class CellposeModel(UnetModel):
              resample=True, interp=True,
              flow_threshold=0.4, cellprob_threshold=0.0,
              compute_masks=True, min_size=15, stitch_threshold=0.0, progress=None,  
-             loop_run=False, model_loaded=False):
+             is_szmodel=False, loop_run=False, model_loaded=False):
         """
             segment list of images x, or 4D array - Z x nchan x Y x X
 
@@ -474,6 +487,9 @@ class CellposeModel(UnetModel):
 
             progress: pyqt progress bar (optional, default None)
                 to return progress bar status to GUI
+
+            is_szmodel : bool
+                whether the current run comes from models.SizeModel
                             
             loop_run: bool (optional, default False)
                 internal variable for determining if model has been loaded, stops model loading in loop over images
@@ -496,7 +512,6 @@ class CellposeModel(UnetModel):
                 style vector summarizing each image, also used to estimate size of objects in image
 
         """
-        
         if isinstance(x, list) or x.squeeze().ndim==5:
             masks, styles, flows = [], [], []
             tqdm_out = utils.TqdmToLogger(models_logger, level=logging.INFO)
@@ -529,7 +544,8 @@ class CellposeModel(UnetModel):
                                                  stitch_threshold=stitch_threshold, 
                                                  progress=progress,
                                                  loop_run=(i>0),
-                                                 model_loaded=model_loaded)
+                                                 model_loaded=model_loaded,
+                                                 is_szmodel=is_szmodel)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -553,6 +569,9 @@ class CellposeModel(UnetModel):
                 diameter = self.diam_labels
                 rescale = self.diam_mean / diameter
 
+            # if not self.is_szmodel:
+            #     print('X input shape before _run_cp', x.shape)
+
             masks, styles, dP, cellprob, p = self._run_cp(x, 
                                                           compute_masks=compute_masks,
                                                           normalize=normalize,
@@ -570,6 +589,7 @@ class CellposeModel(UnetModel):
                                                           do_3D=do_3D, 
                                                           anisotropy=anisotropy,
                                                           stitch_threshold=stitch_threshold,
+                                                          is_szmodel=is_szmodel
                                                           )
             
             flows = [plot.dx_to_circ(dP), dP, cellprob, p]
@@ -579,12 +599,12 @@ class CellposeModel(UnetModel):
                 rescale=1.0, net_avg=False, resample=True,
                 augment=False, tile=True, tile_overlap=0.1,
                 cellprob_threshold=0.0, 
-                flow_threshold=0.4, min_size=15,
+                flow_threshold=0.4, min_size=15, is_szmodel=False,
                 interp=True, anisotropy=1.0, do_3D=False, stitch_threshold=0.0,
                 ):
         
         tic = time.time()
-        shape = x.shape
+        shape = x.shape  # dim: [(Lz), Ly, Lx, chan]
         nimg = shape[0]        
         
         bd, tr = None, None
@@ -610,30 +630,65 @@ class CellposeModel(UnetModel):
             else:
                 dP = np.zeros((2, nimg, int(shape[1]*rescale), int(shape[2]*rescale)), np.float32)
                 cellprob = np.zeros((nimg, int(shape[1]*rescale), int(shape[2]*rescale)), np.float32)
-                
-            for i in iterator:
-                img = np.asarray(x[i])
+
+            if self.do_cgru:  # run eval. in the whole `Lz` patches
+                img = np.asarray(x)
+
+                # if not self.is_szmodel:
+                #     print('X input shape before resize_image', img.shape)
+
+                Ly, Lx = int(shape[1] * rescale), int(shape[2] * rescale)
                 if normalize or invert:
                     img = transforms.normalize_img(img, invert=invert)
                 if rescale != 1.0:
-                    img = transforms.resize_image(img, rsz=rescale)
+                    img = transforms.resize_image(img, Ly=Ly, Lx=Lx)
+
                 yf, style = self._run_nets(img, net_avg=net_avg,
-                                           augment=augment, tile=tile,
+                                           # forcing tile as 0 (tile X implemented for CGRU yet)
+                                           augment=augment, tile=False,
                                            tile_overlap=tile_overlap)
                 if resample:
-                    yf = transforms.resize_image(yf, shape[1], shape[2])
+                    yf = transforms.resize_image(yf, Ly=shape[1], Lx=shape[2])
 
-                cellprob[i] = yf[:,:,2]
-                dP[:, i] = yf[:,:,:2].transpose((2,0,1)) 
-                if self.nclasses == 4:
-                    if i==0:
-                        bd = np.zeros_like(cellprob)
-                    bd[i] = yf[:,:,3]
-                styles[i] = style
+                cellprob = yf[...,2]
+                dP = yf[...,:2].transpose((3,0,1,2))
+                styles = style
+
+            else:  # run eval. in indiv. slices
+                for i in iterator:
+                    img = np.asarray(x[i])
+
+                    # if not self.is_szmodel:
+                    #     print('IMG size before resize core.py', img.shape, rescale)
+
+                    if normalize or invert:
+                        img = transforms.normalize_img(img, invert=invert)
+                    if rescale != 1.0:
+                        img = transforms.resize_image(img, rsz=rescale)
+
+                    # if not self.is_szmodel:
+                    #     print('IMG size before calling core.py', img.shape)
+
+                    yf, style = self._run_nets(img, net_avg=net_avg,
+                                               augment=augment, tile=tile,
+                                               tile_overlap=tile_overlap,
+                                               is_szmodel=is_szmodel)
+                    if resample:
+                        yf = transforms.resize_image(yf, shape[1], shape[2])
+
+                    # if not self.is_szmodel:
+                    #     print('y shape after resample back:', yf.shape)
+
+                    cellprob[i] = yf[:,:,2]
+                    dP[:, i] = yf[:,:,:2].transpose((2,0,1))
+                    if self.nclasses == 4:
+                        if i==0:
+                            bd = np.zeros_like(cellprob)
+                        bd[i] = yf[:,:,3]
+                    styles[i] = style
             del yf, style
         styles = styles.squeeze()
-        
-        
+
         net_time = time.time() - tic
         if nimg > 1:
             models_logger.info('network run in %2.2fs'%(net_time))
@@ -641,6 +696,10 @@ class CellposeModel(UnetModel):
         if compute_masks:
             tic=time.time()
             niter = 200 if (do_3D and not resample) else (1 / rescale * 200)
+
+            # update iterator if performing N-1 prediction with CGRU
+            iterator = trange(dP.shape[1])
+
             if do_3D:
                 masks, p = dynamics.compute_masks(dP, cellprob, niter=niter, 
                                                       cellprob_threshold=cellprob_threshold,
@@ -693,8 +752,8 @@ class CellposeModel(UnetModel):
               channels=None, normalize=True, 
               save_path=None, save_every=100, save_each=False,
               learning_rate=0.2, n_epochs=500, momentum=0.9, SGD=True,
-              weight_decay=0.00001, batch_size=8, nimg_per_epoch=None,
-              rescale=True, min_train_masks=5,
+              weight_decay=0.00001, batch_size=8, rand_perm=False, nimg_per_epoch=None,
+              rescale=True, min_train_masks=0,
               model_name=None):
 
         """ train network with images train_data 
@@ -749,6 +808,9 @@ class CellposeModel(UnetModel):
                 number of 224x224 patches to run simultaneously on the GPU
                 (can make smaller or bigger depending on GPU memory usage)
 
+            rand_perm : bool (default, False)
+                perform index random permutations at each epoch
+
             nimg_per_epoch: int (optional, default None)
                 minimum number of images to train on per epoch, 
                 with a small training set (< 8 images) it may help to set to 8
@@ -765,6 +827,7 @@ class CellposeModel(UnetModel):
                 name of network, otherwise saved with name as params + training start time
 
         """
+        # Update 
         train_data, train_labels, test_data, test_labels, run_test = transforms.reshape_train_test(train_data, train_labels,
                                                                                                    test_data, test_labels,
                                                                                                    channels, normalize)
@@ -791,8 +854,8 @@ class CellposeModel(UnetModel):
                                      save_path=save_path, save_every=save_every, save_each=save_each,
                                      learning_rate=learning_rate, n_epochs=n_epochs, 
                                      momentum=momentum, weight_decay=weight_decay, 
-                                     SGD=SGD, batch_size=batch_size, nimg_per_epoch=nimg_per_epoch, 
-                                     rescale=rescale, model_name=model_name)
+                                     SGD=SGD, batch_size=batch_size, rand_perm=rand_perm, nimg_per_epoch=nimg_per_epoch,
+                                     rescale=rescale, model_name=model_name, do_cgru=self.do_cgru)
         self.pretrained_model = model_path
         return model_path
 
@@ -921,7 +984,8 @@ class SizeModel():
                               batch_size=batch_size, 
                               net_avg=False,
                               resample=False,
-                              compute_masks=False)[-1]
+                              compute_masks=False,
+                              is_szmodel=True)[-1]
 
         diam_style = self._size_estimation(np.array(styles))
         diam_style = self.diam_mean if (diam_style==0 or np.isnan(diam_style)) else diam_style
@@ -941,7 +1005,7 @@ class SizeModel():
                              #flow_threshold=0,
                              diameter=None,
                              interp=False,
-                            )[0]
+                             is_szmodel=True)[0]
         
         diam = utils.diameters(masks)[0]
         diam = self.diam_mean if (diam==0 or np.isnan(diam)) else diam
@@ -1032,7 +1096,7 @@ class SizeModel():
                                                                       Y=[train_labels[i].astype(np.int16) for i in inds], 
                                                                       scale_range=1, xy=(512,512)) 
 
-                feat = self.cp.network(imgi)[1]
+                feat = self.cp.network(imgi, is_szmodel=True)[1]
                 styles[inds+nimg*iepoch] = feat
                 diams[inds+nimg*iepoch] = np.log(diam_train[inds]) - np.log(self.diam_mean) + np.log(scale)
             del feat
@@ -1053,7 +1117,7 @@ class SizeModel():
             nimg_test = len(test_data)
             styles_test = np.zeros((nimg_test, 256), np.float32)
             for i in range(nimg_test):
-                styles_test[i] = self.cp._run_net(test_data[i].transpose((1,2,0)))[1]
+                styles_test[i] = self.cp._run_net(test_data[i].transpose((1,2,0)), is_szmodel=True)[1]
             diam_test_pred = np.exp(A @ (styles_test - smean).T + np.log(self.diam_mean) + ymean)
             diam_test_pred = np.maximum(5., diam_test_pred)
             models_logger.info('test correlation: %0.4f'%np.corrcoef(diam_test, diam_test_pred)[0,1])

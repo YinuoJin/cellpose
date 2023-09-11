@@ -1,7 +1,3 @@
-"""
-Copright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
-"""
-
 import numpy as np
 import warnings
 import cv2
@@ -551,7 +547,7 @@ def resize_image(img0, Ly=None, Lx=None, rsz=None, interpolation=cv2.INTER_LINEA
             Ly = int(img0.shape[-3] * rsz[-2])
             Lx = int(img0.shape[-2] * rsz[-1])
     
-    # no_channels useful for z-stacks, sot he third dimension is not treated as a channel
+    # no_channels useful for z-stacks, so the third dimension is not treated as a channel
     # but if this is called for grayscale images, they first become [Ly,Lx,2] so ndim=3 but 
     if (img0.ndim>2 and no_channels) or (img0.ndim==4 and not no_channels):
         if Ly==0 or Lx==0:
@@ -566,7 +562,7 @@ def resize_image(img0, Ly=None, Lx=None, rsz=None, interpolation=cv2.INTER_LINEA
         imgs = cv2.resize(img0, (Lx, Ly), interpolation=interpolation)
     return imgs
 
-def pad_image_ND(img0, div=16, extra = 1):
+def pad_image_ND(img0, div=16, extra=1):
     """ pad image for test-time so that its dimensions are a multiple of 16 (2D or 3D)
 
     Parameters

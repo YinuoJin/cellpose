@@ -1,7 +1,3 @@
-"""
-Copright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
-"""
-
 import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
 import numpy as np
 import torch
@@ -12,6 +8,7 @@ import datetime
 
 
 from . import transforms, io, dynamics, utils
+from . import cgru
 
 sz = 3
 
@@ -180,7 +177,11 @@ class CPnet(nn.Module):
     def __init__(self, nbase, nout, sz,
                 residual_on=True, style_on=True, 
                 concatenation=False, mkldnn=False,
+                is_szmodel=False, do_cgru=False,
                 diam_mean=30.):
+
+        torch.manual_seed(0)
+
         super(CPnet, self).__init__()
         self.nbase = nbase
         self.nout = nout
@@ -198,24 +199,58 @@ class CPnet(nn.Module):
         self.diam_mean = nn.Parameter(data=torch.ones(1) * diam_mean, requires_grad=False)
         self.diam_labels = nn.Parameter(data=torch.ones(1) * diam_mean, requires_grad=False)
         self.style_on = style_on
-        
+
+        self.is_szmodel = is_szmodel
+        self.path = '/home/yinuo/Desktop/azizi_lab/cell-segmentation/results/cpnet/'
+        self.do_cgru = do_cgru
+
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') # ConvBGRU class requires device def. a priori.
+
+        # DEBUG: try CGRU for each cascade level
+        self.cgru = CGRU(in_channels=3)
+
+        # DEBUG: layers for global weights
+        self._w_s = nn.Parameter(torch.ones((1, 5), device=device)*1/5, requires_grad=True)
+
     def forward(self, data):
         if self.mkldnn:
             data = data.to_mkldnn()
         T0    = self.downsample(data)
+
+        # Cross-slice contextual info. learning;
+        # BN layer dim: T0[-1].shape -> [B, C=256, Y=28, X=28]
+
+        mid_idx = T0[-1].shape[0] // 2
+        if self.do_cgru:
+            for i, T0_lvl in enumerate(T0[:-1]):
+                T0[i] = T0_lvl[mid_idx:mid_idx+1]
+            T0[-1] = self.cgru(T0[-1])
+
         if self.mkldnn:
-            style = self.make_style(T0[-1].to_dense()) 
+            style = self.make_style(T0[-1].to_dense())
         else:
             style = self.make_style(T0[-1])
         style0 = style
         if not self.style_on:
             style = style * 0
+
         T0 = self.upsample(style, T0, self.mkldnn)
-        T0    = self.output(T0)
+        T0 = self.output(T0)
         if self.mkldnn:
-            T0 = T0.to_dense()    
-            #T1 = T1.to_dense()    
+            T0 = T0.to_dense()
+
+        # DEBUG: implement simple global kernel (W1, ..., Wn) + N-to-1
+        # if self.do_cgru:
+        #    T0 = torch.einsum("wz,zcyx->wcyx", self.w_s, T0)
+
         return T0, style0
+
+    @property
+    def w_s(self):
+        return F.softmax(self._w_s, dim=-1)
+
+    def update_sz_model(self, is_sz):
+        self.is_szmodel = is_sz
 
     def save_model(self, filename):
         torch.save(self.state_dict(), filename)
@@ -234,3 +269,79 @@ class CPnet(nn.Module):
                           self.diam_mean)
             state_dict = torch.load(filename, map_location=torch.device('cpu'))
         self.load_state_dict(dict([(name, param) for name, param in state_dict.items()]), strict=False)
+
+
+# Add CGRU architecture
+# now we have 4D tensor as input & output, we treat batch size == depth for CGRU
+# x_in dim: [B/Z, C=2, Y, X], x_out dim: [B/Z, C=3, Y, X]
+
+# TODO: compare
+#  - N-N vs. N-1 (without masked autoregression)
+#  - add stateful CGRU (see cgru.py line 58, 103, 114)
+#  - Try freezing all Cellpose & only retrain CGRU part
+class CGRU(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            hidden_channels=256,
+            ksize=5
+    ):
+        super(CGRU, self).__init__()
+
+        self.enc = nn.Conv3d(in_channels, hidden_channels, kernel_size=1)
+        self.bgru = cgru.ConvBGRU(
+            in_channels=hidden_channels,
+            hidden_channels=hidden_channels//2,
+            kernel_size=(ksize, ksize),
+            num_layers=1,
+            batch_first=True,
+            # combine_option='avg',
+            combine_option='concat'
+        )
+
+        # DEBUG
+        self.out_channels = hidden_channels//2
+        
+        self.dec = nn.Conv3d(hidden_channels, in_channels, kernel_size=1)
+        self.mask_layer = None  # to be deleted
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') # ConvBGRU class requires device def. a priori.
+
+        self.enc, self.dec, self.bgru = self.enc.to(self.device), self.dec.to(self.device), self.bgru.to(self.device)
+        self.bgru.apply(self._init_weights)
+
+    def forward(self, x):
+        x = x.to(self.device)
+
+        """
+        # CGRU attached to Cellpose 2nd to last Decoder layer
+        x = torch.transpose(
+            torch.unsqueeze(x, dim=0),
+            1, 2
+        )  # dim: [B, C, H, W] -> [1, C, B, H, W]
+        x = self.enc(x)
+
+        x_fwd = x.transpose(1, 2)  # dim: [1, C, B, H, W] -> [1, B, C, H, W] for CGRU
+        x_bwd = x_fwd.flip(1)
+        x_gru = self.bgru(x_fwd, x_bwd)
+
+        x_out = self.dec(x_gru.transpose(1, 2))  # dim: [1, B, C, H, W] -> [1, C, B, H. W] for decoder
+        out = torch.squeeze(
+            torch.transpose(x_out, 1, 2),
+            dim=0)  # dim: [1, C, B, H, W] -> [B, C, H, W]
+        """
+
+        # CGRU attached to Cellpose BN layer
+        x_fwd = torch.unsqueeze(x, dim=0)  # [B, C, H, W] -> [1, B, C, H, W]
+        x_bwd = x_fwd.flip(1)
+        x_gru = self.bgru(x_fwd, x_bwd)
+        out = torch.squeeze(x_gru, dim=0)  # [1, B, C, H, W] -> [B, C, H, W]
+
+        # N-1 prediction [x-n,..., x+n] -> y_i, only return axis Z=mid_idx
+        mid_idx = out.shape[0] // 2
+        return out[mid_idx:mid_idx+1]
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.xavier_uniform_(m.weight)
+            m.bias.data.fill_(0.01)
+    

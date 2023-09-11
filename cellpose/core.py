@@ -1,7 +1,3 @@
-"""
-Copright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
-"""
-
 import os, sys, time, shutil, tempfile, datetime, pathlib, subprocess
 import logging
 import numpy as np
@@ -110,7 +106,7 @@ class UnetModel():
     def __init__(self, gpu=False, pretrained_model=False,
                     diam_mean=30., net_avg=False, device=None,
                     residual_on=False, style_on=False, concatenation=True,
-                    nclasses=3, nchan=2):
+                    nclasses=3, nchan=2, is_szmodel=False, do_cgru=False):
         self.unet = True
         self.torch = True
         self.mkldnn = None
@@ -124,6 +120,7 @@ class UnetModel():
             self.mkldnn = check_mkl(True)
         self.pretrained_model = pretrained_model
         self.diam_mean = diam_mean
+        self.do_cgru = do_cgru
 
         ostr = ['off', 'on']
         self.net_type = 'unet{}_residual_{}_style_{}_concatenation_{}'.format(nclasses,
@@ -134,9 +131,13 @@ class UnetModel():
             core_logger.info(f'u-net net type: {self.net_type}')
         # create network
         self.nclasses = nclasses
-        self.nbase = [32,64,128,256]
         self.nchan = nchan
         self.nbase = [nchan, 32, 64, 128, 256]
+
+        # DEBUG: freeze the CPnet output to CGRU to learn cross-slice contextual information
+        self.is_szmodel = is_szmodel
+        # self.path = '/home/yinuo/Desktop/azizi_lab/cell-segmentation/results/cpnet/'
+
         self.net = resnet_torch.CPnet(self.nbase, 
                                         self.nclasses, 
                                         sz=3,
@@ -144,7 +145,9 @@ class UnetModel():
                                         style_on=style_on,
                                         concatenation=concatenation,
                                         mkldnn=self.mkldnn,
-                                        diam_mean=diam_mean).to(self.device)
+                                        diam_mean=diam_mean,
+                                        is_szmodel=is_szmodel,
+                                        do_cgru=do_cgru).to(self.device)
         
         if pretrained_model is not None and isinstance(pretrained_model, str):
             self.net.load_model(pretrained_model, device=self.device)
@@ -269,7 +272,7 @@ class UnetModel():
                 # rescale image for flow computation
                 img = transforms.resize_image(img, rsz=rescale[i])
                 y, style = self._run_nets(img, net_avg=net_avg, augment=augment, 
-                                          tile=tile)
+                                          is_szmodel=self.is_szmodel, tile=tile)
                 if compute_masks:
                     maski = utils.get_masks_unet(y, cell_threshold, boundary_threshold)
                     maski = utils.fill_holes_and_remove_small_masks(maski, min_size=min_size)
@@ -309,8 +312,15 @@ class UnetModel():
         x = X.detach().cpu().numpy()
         return x
 
-    def network(self, x, return_conv=False):
+    def network(self, x, is_szmodel=False, return_conv=False):
         """ convert imgs to torch and run network model and return numpy """
+        # Update status whether the current run is from `models.SizeModel`
+        self.is_szmodel = is_szmodel
+        if isinstance(self.net, nn.DataParallel):
+            self.net.module.update_sz_model(is_szmodel)
+        else:
+            self.net.update_sz_model(is_szmodel)
+
         X = self._to_device(x)
         self.net.eval()
         if self.mkldnn:
@@ -327,7 +337,7 @@ class UnetModel():
         return y, style
                 
     def _run_nets(self, img, net_avg=False, augment=False, tile=True, tile_overlap=0.1, bsize=224, 
-                  return_conv=False, progress=None):
+                  is_szmodel=False, return_conv=False, progress=None):
         """ run network (if more than one, loop over networks and average results
 
         Parameters
@@ -347,6 +357,9 @@ class UnetModel():
         tile_overlap: float (optional, default 0.1)
             fraction of overlap of tiles when computing flows
 
+        is_szmodel : bool
+            whether the current run comes from models.SizeModel
+
         progress: pyqt progress bar (optional, default None)
                 to return progress bar status to GUI
 
@@ -365,13 +378,13 @@ class UnetModel():
         """
         if isinstance(self.pretrained_model, str) or not net_avg:  
             y, style = self._run_net(img, augment=augment, tile=tile, tile_overlap=tile_overlap,
-                                     bsize=bsize, return_conv=return_conv)
+                                     bsize=bsize, is_szmodel=is_szmodel, return_conv=return_conv)
         else:  
             for j in range(len(self.pretrained_model)):
                 self.net.load_model(self.pretrained_model[j], device=self.device)
                 y0, style = self._run_net(img, augment=augment, tile=tile, 
                                           tile_overlap=tile_overlap, bsize=bsize,
-                                          return_conv=return_conv)
+                                          is_szmodel=is_szmodel, return_conv=return_conv)
 
                 if j==0:
                     y = y0
@@ -384,7 +397,7 @@ class UnetModel():
         return y, style
 
     def _run_net(self, imgs, augment=False, tile=True, tile_overlap=0.1, bsize=224,
-                 return_conv=False):
+                 is_szmodel=False, return_conv=False):
         """ run network on image or stack of images
 
         (faster if augment is False)
@@ -393,9 +406,6 @@ class UnetModel():
         --------------
 
         imgs: array [Ly x Lx x nchan] or [Lz x Ly x Lx x nchan]
-
-        rsz: float (optional, default 1.0)
-            resize coefficient(s) for image
 
         augment: bool (optional, default False)
             tiles image with overlapping tiles and flips overlapped regions to augment
@@ -433,8 +443,7 @@ class UnetModel():
 
         # pad image for net so Ly and Lx are divisible by 4
         imgs, ysub, xsub = transforms.pad_image_ND(imgs)
-        # slices from padding
-#         slc = [slice(0, self.nclasses) for n in range(imgs.ndim)] # changed from imgs.shape[n]+1 for first slice size 
+
         slc = [slice(0, imgs.shape[n]+1) for n in range(imgs.ndim)]
         slc[-3] = slice(0, self.nclasses + 32*return_conv + 1)
         slc[-2] = slice(ysub[0], ysub[-1]+1)
@@ -442,14 +451,20 @@ class UnetModel():
         slc = tuple(slc)
 
         # run network
-        if tile or augment or imgs.ndim==4:
+        if (tile or augment or imgs.ndim==4) and not self.do_cgru:
             y, style = self._run_tiled(imgs, augment=augment, bsize=bsize, 
-                                      tile_overlap=tile_overlap, 
+                                      tile_overlap=tile_overlap,
+                                      is_szmodel=is_szmodel,
                                       return_conv=return_conv)
+
         else:
-            imgs = np.expand_dims(imgs, axis=0)
-            y, style = self.network(imgs, return_conv=return_conv)
-            y, style = y[0], style[0]
+            if imgs.ndim < 4:
+                imgs = np.expand_dims(imgs, axis=0)
+            # if not self.is_szmodel:
+            #     print('x[i] shape for CPnet', imgs.shape)
+            y, style = self.network(imgs, is_szmodel=is_szmodel, return_conv=return_conv)
+            if not self.do_cgru:
+                y, style = y[0], style[0]
         style /= (style**2).sum()**0.5
 
         # slice out padding
@@ -459,7 +474,7 @@ class UnetModel():
         
         return y, style
     
-    def _run_tiled(self, imgi, augment=False, bsize=224, tile_overlap=0.1, return_conv=False):
+    def _run_tiled(self, imgi, augment=False, bsize=224, tile_overlap=0.1, is_szmodel=False, return_conv=False):
         """ run network in tiles of size [bsize x bsize]
 
         First image is split into overlapping tiles of size [bsize x bsize].
@@ -503,8 +518,8 @@ class UnetModel():
             if ny*nx > batch_size:
                 ziterator = trange(Lz, file=tqdm_out)
                 for i in ziterator:
-                    yfi, stylei = self._run_tiled(imgi[i], augment=augment, 
-                                                  bsize=bsize, tile_overlap=tile_overlap)
+                    yfi, stylei = self._run_tiled(imgi[i], augment=augment, bsize=bsize,
+                                                  is_szmodel=is_szmodel, tile_overlap=tile_overlap)
                     yf[i] = yfi
                     styles.append(stylei)
             else:
@@ -519,7 +534,7 @@ class UnetModel():
                         IMG, ysub, xsub, Ly, Lx = transforms.make_tiles(imgi[k*nimgs+i], bsize=bsize, 
                                                                         augment=augment, tile_overlap=tile_overlap)
                         IMGa[i*ntiles:(i+1)*ntiles] = np.reshape(IMG, (ny*nx, nchan, ly, lx))
-                    ya, stylea = self.network(IMGa)
+                    ya, stylea = self.network(IMGa, is_szmodel=is_szmodel)
                     for i in range(min(Lz-k*nimgs, nimgs)):
                         y = ya[i*ntiles:(i+1)*ntiles]
                         if augment:
@@ -536,6 +551,11 @@ class UnetModel():
         else:
             IMG, ysub, xsub, Ly, Lx = transforms.make_tiles(imgi, bsize=bsize, 
                                                             augment=augment, tile_overlap=tile_overlap)
+
+            # if not self.is_szmodel:
+            #     print(imgi.shape, IMG.shape)
+            #     print(Ly, Lx)
+
             ny, nx, nchan, ly, lx = IMG.shape
             IMG = np.reshape(IMG, (ny*nx, nchan, ly, lx))
             batch_size = self.batch_size
@@ -543,9 +563,9 @@ class UnetModel():
             nout = self.nclasses + 32*return_conv
             y = np.zeros((IMG.shape[0], nout, ly, lx))
             for k in range(niter):
-                irange = slice(batch_size*k, min(IMG.shape[0], batch_size*k+batch_size))
-                y0, style = self.network(IMG[irange], return_conv=return_conv)
-                y[irange] = y0.reshape(irange.stop-irange.start, y0.shape[-3], y0.shape[-2], y0.shape[-1])
+                irange = np.arange(batch_size*k, min(IMG.shape[0], batch_size*k+batch_size))
+                y0, style = self.network(IMG[irange], is_szmodel=is_szmodel, return_conv=return_conv)
+                y[irange] = y0.reshape(len(irange), y0.shape[-3], y0.shape[-2], y0.shape[-1])
                 if k==0:
                     styles = style[0]
                 styles += style.sum(axis=0)
@@ -554,9 +574,16 @@ class UnetModel():
                 y = np.reshape(y, (ny, nx, nout, bsize, bsize))
                 y = transforms.unaugment_tiles(y, self.unet)
                 y = np.reshape(y, (-1, nout, bsize, bsize))
-            
+
+            # if not self.is_szmodel:
+            #     print('y shape before avg tiles:', y.shape)
+
             yf = transforms.average_tiles(y, ysub, xsub, Ly, Lx)
             yf = yf[:,:imgi.shape[1],:imgi.shape[2]]
+
+            # if not self.is_szmodel:
+            #     print('y shape after avg tiles:', yf.shape)
+
             styles /= (styles**2).sum()**0.5
             return yf, styles
 
@@ -651,7 +678,7 @@ class UnetModel():
               test_data=None, test_labels=None, test_files=None,
               channels=None, normalize=True, save_path=None, save_every=100, save_each=False,
               learning_rate=0.2, n_epochs=500, momentum=0.9, weight_decay=0.00001, batch_size=8, 
-              nimg_per_epoch=None, min_train_masks=5, rescale=False, model_name=None):
+              rand_perm=False, nimg_per_epoch=None, min_train_masks=0, rescale=False, model_name=None):
         """ train function uses 0-1 mask label and boundary pixels for training """
 
         nimg = len(train_data)
@@ -697,14 +724,46 @@ class UnetModel():
         model_path = self._train_net(train_data, train_classes, test_data, test_classes,
                                     save_path=save_path, save_every=save_every, save_each=save_each,
                                     learning_rate=learning_rate, n_epochs=n_epochs, momentum=momentum, 
-                                    weight_decay=weight_decay, SGD=True, batch_size=batch_size, 
-                                    nimg_per_epoch=nimg_per_epoch, rescale=rescale, model_name=model_name)
+                                    weight_decay=weight_decay, SGD=True, batch_size=batch_size, rand_perm=rand_perm,
+                                    nimg_per_epoch=nimg_per_epoch, rescale=rescale, model_name=model_name, do_cgru=self.do_cgru)
 
         # find threshold using validation set
         core_logger.info('>>>> finding best thresholds using validation set')
         cell_threshold, boundary_threshold = self.threshold_validation(val_data, val_labels)
         np.save(model_path+'_cell_boundary_threshold.npy', np.array([cell_threshold, boundary_threshold]))
         return model_path
+
+    def _train_step(self, x, lbl):
+        # DEBUG: try masked autoregression
+        X = self._to_device(x)
+        self.optimizer.zero_grad()
+
+        if self.do_cgru:
+            # input: (x_{i-n},...,x_{i-1},x_{i+1},...,x_{i+n})
+            # output: y_i
+            mid_idx = lbl.shape[0]//2
+            lbl = lbl[mid_idx:mid_idx+1]
+
+        self.net.train()
+        y = self.net(X)[0]
+
+        # # DEBUG: print whether w is learning
+        # if self.do_cgru:
+        #     print('W_s:', self.net.w_s.detach().cpu().numpy())
+
+        del X
+        if isinstance(y, torch.Tensor):
+            y = y.to(self.device)
+
+        loss = self.loss_fn(lbl, y)
+        loss.backward()
+        train_loss = loss.item()
+        if self.do_cgru:
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+
+        self.optimizer.step()
+        train_loss *= len(x)
+        return train_loss
 
     def threshold_validation(self, val_data, val_labels):
         cell_thresholds = np.arange(-4.0, 4.25, 0.5)
@@ -727,36 +786,25 @@ class UnetModel():
             else:
                 kbest = 0
             if j%4==0:
-                core_logger.info('best threshold at cell_threshold = {} => boundary_threshold = {}, ap @ 0.5 = {}'.format(cell_threshold, boundary_thresholds[kbest], 
-                                                                        aps[j,kbest,0]))   
-        if self.nclasses==3: 
+                core_logger.info('best threshold at cell_threshold = {} => boundary_threshold = {}, ap @ 0.5 = {}'.format(cell_threshold, boundary_thresholds[kbest],
+                                                                        aps[j,kbest,0]))
+        if self.nclasses==3:
             jbest, kbest = np.unravel_index(aps.mean(axis=-1).argmax(), aps.shape[:2])
         else:
             jbest = aps.squeeze().mean(axis=-1).argmax()
             kbest = 0
         cell_threshold, boundary_threshold = cell_thresholds[jbest], boundary_thresholds[kbest]
-        core_logger.info('>>>> best overall thresholds: (cell_threshold = {}, boundary_threshold = {}); ap @ 0.5 = {}'.format(cell_threshold, boundary_threshold, 
+        core_logger.info('>>>> best overall thresholds: (cell_threshold = {}, boundary_threshold = {}); ap @ 0.5 = {}'.format(cell_threshold, boundary_threshold,
                                                           aps[jbest,kbest,0]))
         return cell_threshold, boundary_threshold
 
-    def _train_step(self, x, lbl):
-        X = self._to_device(x)
-        self.optimizer.zero_grad()
-        #if self.gpu:
-        #    self.net.train() #.cuda()
-        #else:
-        self.net.train()
-        y = self.net(X)[0]
-        del X
-        loss = self.loss_fn(lbl,y)
-        loss.backward()
-        train_loss = loss.item()
-        self.optimizer.step()
-        train_loss *= len(x)
-        return train_loss
-
     def _test_eval(self, x, lbl):
+        # DEBUG: try masked autoregression
         X = self._to_device(x)
+        if self.do_cgru:
+            mid_idx = lbl.shape[0]//2
+            lbl = lbl[mid_idx:mid_idx+1]
+
         self.net.eval()
         with torch.no_grad():
             y, style = self.net(X)
@@ -791,12 +839,16 @@ class UnetModel():
     def _train_net(self, train_data, train_labels, 
               test_data=None, test_labels=None,
               save_path=None, save_every=100, save_each=False,
-              learning_rate=0.2, n_epochs=500, momentum=0.9, weight_decay=0.00001, 
-              SGD=True, batch_size=8, nimg_per_epoch=None, rescale=True, model_name=None): 
-        """ train function uses loss function self.loss_fn in models.py"""
-        
+              learning_rate=0.2, n_epochs=500, momentum=0.9, weight_decay=0.00001, SGD=True, rand_perm=False,
+              batch_size=8, nimg_per_epoch=None, nzstack=20, rescale=True, model_name=None, do_cgru=False):
+        """ train function uses loss function self.loss_fn in models.py """
+
+        # TODO: for attaching `CPnet` output to CGRU, directly concatenate all results withing a `batch_size`
+        # e.g. if batch_size=8, then pipe [Z=8, Ntiles, C, Y, X] outputs to CGRU & return;
+        # see line 921
         d = datetime.datetime.now()
-        
+        self.net.do_cgru = do_cgru
+
         self.n_epochs = n_epochs
         if isinstance(learning_rate, (list, np.ndarray)):
             if isinstance(learning_rate, np.ndarray) and learning_rate.ndim > 1:
@@ -875,27 +927,40 @@ class UnetModel():
         # get indices for each epoch for training
         np.random.seed(0)
         inds_all = np.zeros((0,), 'int32')
-        if nimg_per_epoch is None or nimg > nimg_per_epoch:
-            nimg_per_epoch = nimg 
+
         core_logger.info(f'>>>> nimg_per_epoch = {nimg_per_epoch}')
-        while len(inds_all) < n_epochs * nimg_per_epoch:
-            rperm = np.random.permutation(nimg)
+        while len(inds_all) < n_epochs * nimg:
+            rperm = np.random.permutation(nimg) if rand_perm else np.arange(nimg)
             inds_all = np.hstack((inds_all, rperm))
+
+        if not self.is_szmodel and self.net.do_cgru:
+            core_logger.info(f'>>>> performing ConvGRU to learn cross-slice contextual infomation')
         
         for iepoch in range(self.n_epochs):    
             if SGD:
                 self._set_learning_rate(self.learning_rate[iepoch])
-            np.random.seed(iepoch)
             rperm = inds_all[iepoch*nimg_per_epoch:(iepoch+1)*nimg_per_epoch]
-            for ibatch in range(0,nimg_per_epoch,batch_size):
+            if self.do_cgru:
+                iterator = [
+                    idx
+                    for slc in range(0, nimg_per_epoch, nzstack)
+                    for idx in range(slc, slc+nzstack-batch_size+1)
+                ]
+            else:
+                iterator = range(0, nimg_per_epoch, batch_size)
+            # iterator = range(0, nimg_per_epoch-batch_size+1) if self.do_cgru else range(0, nimg_per_epoch, batch_size)
+
+            for ibatch in iterator:
                 inds = rperm[ibatch:ibatch+batch_size]
                 rsc = diam_train[inds] / self.diam_mean if rescale else np.ones(len(inds), np.float32)
                 # now passing in the full train array, need the labels for distance field
                 imgi, lbl, scale = transforms.random_rotate_and_resize(
                                         [train_data[i] for i in inds], Y=[train_labels[i][1:] for i in inds],
+                                        do_flip=False, random_per_image=False,   # mute per-img augmentation for 3D training
                                         rescale=rsc, scale_range=scale_range, unet=self.unet)
+
                 if self.unet and lbl.shape[1]>1 and rescale:
-                    lbl[:,1] *= scale[:,np.newaxis,np.newaxis]**2#diam_batch[:,np.newaxis,np.newaxis]**2
+                    lbl[:,1] *= scale[:,np.newaxis,np.newaxis]**2
                 train_loss = self._train_step(imgi, lbl)
                 lavg += train_loss
                 nsum += len(imgi) 
@@ -904,7 +969,8 @@ class UnetModel():
                 lavg = lavg / nsum
                 if test_data is not None:
                     lavgt, nsum = 0., 0
-                    np.random.seed(42)
+                    # np.random.seed(42)
+
                     rperm = np.arange(0, len(test_data), 1, int)
                     for ibatch in range(0,len(test_data),batch_size):
                         inds = rperm[ibatch:ibatch+batch_size]
@@ -921,6 +987,9 @@ class UnetModel():
 
                     core_logger.info('Epoch %d, Time %4.1fs, Loss %2.4f, Loss Test %2.4f, LR %2.4f'%
                             (iepoch, time.time()-tic, lavg, lavgt/nsum, self.learning_rate[iepoch]))
+                    # core_logger.info('Learnt smoothing weights: {}'.format(
+                    #     self.net.w_s.detach().cpu().numpy().squeeze()
+                    # ))
                 else:
                     core_logger.info('Epoch %d, Time %4.1fs, Loss %2.4f, LR %2.4f'%
                             (iepoch, time.time()-tic, lavg, self.learning_rate[iepoch]))
